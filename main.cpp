@@ -9,7 +9,7 @@
 namespace
 {
     const size_t cSamplesPoints = 8;
-    const cv::Point cAreaShift(50, 50);
+    const cv::Point cAreaShift(60, 60);
 
     enum class SampleType
     {
@@ -59,7 +59,7 @@ double concentrationBySampleType(SampleType sampleType)
     return cConcMap.at(sampleType);
 }
 
-std::array<cv::Point, cSamplesPoints> findSamplesPoints(const cv::Mat &image)
+cv::Mat buildRedMask(const cv::Mat &image)
 {
     cv::Mat hsvImage;
     cv::cvtColor(image, hsvImage, cv::COLOR_BGR2HSV);
@@ -68,7 +68,21 @@ std::array<cv::Point, cSamplesPoints> findSamplesPoints(const cv::Mat &image)
     cv::Mat upperRange;
     cv::inRange(hsvImage, cv::Scalar(0, 50, 50), cv::Scalar(10, 255, 255), lowerRange);
     cv::inRange(hsvImage, cv::Scalar(160, 50, 50), cv::Scalar(179, 255, 255), upperRange);
-    cv::Mat filteredImage = lowerRange + upperRange;
+    lowerRange += upperRange;
+
+    const int erosion_type = cv::MORPH_ELLIPSE;
+    const int erosion_size = 15;
+    const cv::Mat element = cv::getStructuringElement(erosion_type,
+                                                cv::Size(2 * erosion_size + 1, 2 * erosion_size + 1),
+                                                cv::Point(erosion_size, erosion_size));
+
+    cv::erode(lowerRange, lowerRange, element);
+    return lowerRange;
+}
+
+std::array<cv::Point, cSamplesPoints> findSamplesPoints(const cv::Mat &image)
+{
+    cv::Mat filteredImage = buildRedMask(image);
 
     std::vector<cv::Point> nonZeroPoints;
     cv::findNonZero(filteredImage, nonZeroPoints);
@@ -197,17 +211,73 @@ double getConcentrationValue(const cv::Vec2f &model, double intensity)
     return std::exp(model[0] * intensity + model[1]) - 1;
 }
 
-cv::Vec2f buildLinearLogScaleModel(const std::map<SampleType, cv::Mat> &rois)
+std::vector<SampleType> getAllSampleTypes()
+{
+    return {
+        SampleType::C1,
+        SampleType::C2,
+        SampleType::C3,
+        SampleType::C4,
+        SampleType::C5,
+        SampleType::C6,
+        SampleType::QC1,
+        SampleType::QC2,
+        SampleType::Tested,
+    };
+}
+
+double getMeanIntensity(const cv::Point &origin, const cv::Mat &mask, const cv::Mat &image)
+{
+    cv::Rect boundingRect;
+    cv::Mat cloned = mask.clone();
+    static const uchar cColorValue = 1;
+    cv::floodFill(cloned, origin, cv::Scalar(cColorValue), &boundingRect);
+
+    double intensitySum = 0;
+    size_t qty = 0;
+
+    for (int r = 0; r < boundingRect.height; ++r) {
+        for (int c = 0; c < boundingRect.width; ++c) {
+            const int row = boundingRect.tl().y + r;
+            const int col = boundingRect.tl().x + c;
+            if (cloned.at<uchar>(row, col) == cColorValue) {
+                intensitySum += image.at<uchar>(row, col);
+                qty++;
+            }
+        }
+    }
+
+    return intensitySum / qty;
+}
+
+std::map<SampleType, double> buildMeanIntensitiesMap
+(
+    const std::map<SampleType, cv::Point> &origins,
+    const cv::Mat &mask,
+    const cv::Mat &image
+)
+{
+    cv::Mat grayscale;
+    cv::cvtColor(image, grayscale, cv::COLOR_BGR2GRAY);
+
+    std::map<SampleType, double> intensityMap;
+    for (const auto &sampleType : getAllSampleTypes()) {
+        intensityMap[sampleType] = getMeanIntensity(origins.at(sampleType), mask, grayscale);
+    }
+
+    intensityMap[SampleType::C1] = 255;
+
+    return intensityMap;
+}
+
+cv::Vec2f buildLinearLogScaleModel(const std::map<SampleType, double> &intensityMap)
 {
     std::vector<cv::Point2f> points;
-    for (const auto &r : rois) {
+    for (const auto &r : intensityMap) {
         if (r.first != SampleType::Tested && r.first != SampleType::QC1 && r.first != SampleType::QC2) {
-            const auto meanValue = getMeanIntensity(r.second);
+            const auto meanValue = r.second;
             const auto conc = std::log(concentrationBySampleType(r.first) + 1);
             points.emplace_back(meanValue, conc);
-#ifdef DEBUG
-            showImage(r.second);
-#endif
         }
     }
 
@@ -238,21 +308,6 @@ std::string sampleTypeName(SampleType sampleType)
     return "";
 }
 
-std::vector<SampleType> getAllSampleTypes()
-{
-    return {
-        SampleType::C1,
-        SampleType::C2,
-        SampleType::C3,
-        SampleType::C4,
-        SampleType::C5,
-        SampleType::C6,
-        SampleType::QC1,
-        SampleType::QC2,
-        SampleType::Tested,
-    };
-}
-
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -266,30 +321,45 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    cv::GaussianBlur(image, image, cv::Size(5, 5), 0);
+
     const auto samplesPoints = findSamplesPoints(image);
     const auto markedPoints = getMarkedPointsMap(samplesPoints);
-
-    cv::GaussianBlur(image, image, cv::Size(5, 5), 0, 0);
-
-    const auto rois = getSamplesRoisMap(image, markedPoints);
-    const cv::Vec2f lineCoef = buildLinearLogScaleModel(rois);
+    const cv::Mat mask = buildRedMask(image);
+    const auto meanIntensityMap = buildMeanIntensitiesMap(markedPoints, mask, image);
+    const cv::Vec2f lineCoef = buildLinearLogScaleModel(meanIntensityMap);
 
     for (const auto &sample : getAllSampleTypes()) {
-        const auto intensity = getMeanIntensity(rois.at(sample));
+        const auto intensity = meanIntensityMap.at(sample);
         std::cout << sampleTypeName(sample) << ": "
                   << "MEAN INTENSITY = " << intensity << ", "
                   << "ESTIMATED CONCENTRATION = " << getConcentrationValue(lineCoef, intensity)
                   << std::endl;
     }
 
-    for (const auto &markedPoint : markedPoints) {
-        const auto p = markedPoint.second;
-        const cv::Rect rect(p - cAreaShift, p + cAreaShift);
-        cv::rectangle(image, rect, CV_RGB(0, 0, 255), 3);
+    const auto printVariation = [&lineCoef, &meanIntensityMap] (SampleType sampleType) {
+        const auto actualConc =  getConcentrationValue(lineCoef, meanIntensityMap.at(sampleType));
+        const auto refConc = concentrationBySampleType(sampleType);
+        std::cout << "VARIATION " << sampleTypeName(sampleType) << " = "
+                  << std::fabs(actualConc - refConc) / refConc * 100 << "%"
+                  << std::endl;
+    };
+
+    printVariation(SampleType::QC1);
+    printVariation(SampleType::QC2);
+
+#ifdef DEBUG
+    for (int i = 0; i < mask.rows; ++i) {
+        for (int j = 0; j < mask.cols; ++j) {
+            if (mask.at<uchar>(i, j) == 0) {
+                image.at<cv::Vec3b>(i, j) = cv::Vec3b(0, 255, 0);
+            }
+        }
     }
 
-    cv::resize(image, image, cv::Size(image.cols / 4, image.rows / 4));
+    image = cv::Mat(image, cv::Rect(cv::Point(1000, 900), cv::Size(800, 800)));
     showImage(image);
+#endif
 
     return 0;
 }
