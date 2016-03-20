@@ -1,9 +1,18 @@
 #include <array>
+#include <map>
 #include <limits>
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
+
+#define LOGD(...)
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#define LOG_TAG "TestAnalysis_native"
+#define LOGD(...) ( (void)__android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__) )
+#endif
 
 #include "analysis.h"
 
@@ -72,6 +81,8 @@ std::array<cv::Point, cSamplesPoints> findSamplesPoints(const cv::Mat &image)
 
     std::vector<cv::Point> nonZeroPoints;
     cv::findNonZero(filteredImage, nonZeroPoints);
+
+    LOGD("NON-ZERO POINTS %d", nonZeroPoints.size());
 
     cv::Mat inputData(nonZeroPoints.size(), 2, CV_32F);
     for (size_t i = 0; i < nonZeroPoints.size(); ++i) {
@@ -297,7 +308,14 @@ std::string sampleTypeName(SampleType sampleType)
 TestInfo detectConcentrations(const cv::Mat &input)
 {
     cv::Mat image = input.clone();
+
+#ifdef __ANDROID__
+    cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
+#endif
+
     cv::GaussianBlur(image, image, cv::Size(5, 5), 0);
+
+    LOGD("IMAGE: %d %d", image.rows, image.cols);
 
     const auto samplesPoints = findSamplesPoints(image);
     const auto markedPoints = getMarkedPointsMap(samplesPoints);
